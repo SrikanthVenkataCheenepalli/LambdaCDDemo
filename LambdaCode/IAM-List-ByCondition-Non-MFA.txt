@@ -1,0 +1,195 @@
+import boto3
+import csv
+from botocore.exceptions import ClientError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+import os
+import json
+
+
+from datetime import datetime
+from boto3.dynamodb.conditions import Key, Attr
+
+#Boto3 Variable declarations
+dynamodbResource  = boto3.resource('dynamodb')
+dynamodbClient = boto3.client('dynamodb')
+
+tableName = "IAM-UserDetails"
+columnName= "MFA_Enabled"
+columnValue="False"
+
+def lambda_handler(event, context):
+    userList_csvFile="/tmp/NonMFA-UserList.csv"
+    isHeader=True
+    S3BucketName="merck-infrastructure-reports"
+    s3ObjectName='UserList_NonMFAEnabled'+ datetime.now().strftime('%d_%m_%Y')+'.csv'
+    response = getRecordsByColumn(tableName,columnName,columnValue)
+    outfile = open(userList_csvFile,"w")
+    writer =  csv.writer(outfile)
+    body_data ="<table>"
+    now = datetime.now()
+    
+    for user in response['Items']:
+        if(isHeader):
+            
+            body_data = body_data +"<tr>"
+            for rowheader in user.keys():
+              body_data = body_data +"<th style='background-color:#DBDBDB'>"+str(rowheader)+"</th>"
+            body_data = body_data +"</tr>"  
+            #print(user.keys())
+            writer.writerow(user.keys())
+            isHeader=False
+        else:
+            
+      
+            pwd_last_used = user['pwd_last_used']
+            print("pwd last used",pwd_last_used)
+            pwd_age = (now - (datetime.strptime(str(pwd_last_used),'%m/%d/%Y'))).days
+            if(pwd_age < 90):
+              body_data = body_data +"<tr>"
+              writer.writerow(user.values())
+              for rowvalue in user.values():
+                print("pwd is not expired ",pwd_age)
+                body_data = body_data +"<td>"+str(rowvalue)+"</td>"
+                          
+              
+              body_data = body_data +"</tr>"  # end the table row
+      
+            
+    body_data = body_data + "</table>"        
+    outfile.close()
+    s3ObjectPath='Non-MFA-User-List/'+s3ObjectName
+    response = save_to_s3(userList_csvFile,S3BucketName,s3ObjectPath)
+    send_mail_att(userList_csvFile,body_data)
+    print("Response from save save_to_s3",response)
+    return 'Hello from Lambda'
+    
+def send_mail_att(userList_csvFile,body_data):
+   
+  
+    SENDER = 'cloud-operations@merckgroup.com'
+    RECIPIENT = "cloud-operations@merckgroup.com"
+    AWS_REGION = "eu-west-1"
+  
+
+    SUBJECT = "Non-MFA- IAM User List"
+    ATTACHMENT = userList_csvFile
+      
+      # The email body for recipients with non-HTML email clients.
+    BODY_TEXT = "Hello,\r\nPlease see the attached file for a list of customers to contact."
+      
+      # The HTML body of the email.
+    BODY_HTML = """\
+      <html>
+      <head>
+       <style>
+          table {
+            font-family: arial, sans-serif;
+            border-collapse: collapse;
+            width: 50%;
+            background-color:#E5E9FF;
+            
+          }
+        
+        td, th {
+            border: 1px solid #dddddd;
+            text-align: left;
+            padding: 6px;
+        }
+        
+        
+        </style>
+      </head>
+      <body>
+      Dear Team,
+      <p>Please see the below/attached  list of useres who doesn't have MFA enabled.</p>
+     
+     """ + body_data + """
+     </br>Thanks and Regards,
+     </br>MFA Complaince check
+      </body>
+      </html>
+      """
+      
+      # The character encoding for the email.
+    CHARSET = "utf-8"
+      
+      # Create a new SES resource and specify a region.
+    client = boto3.client('ses',region_name=AWS_REGION)
+      
+      # Create a multipart/mixed parent container.
+    msg = MIMEMultipart('mixed')
+      # Add subject, from and to lines.
+    msg['Subject'] = SUBJECT 
+    msg['From'] = SENDER 
+    msg['To'] = RECIPIENT
+      
+      # Create a multipart/alternative child container.
+    msg_body = MIMEMultipart('alternative')
+      
+      # Encode the text and HTML content and set the character encoding. This step is
+      # necessary if you're sending a message with characters outside the ASCII range.
+    textpart = MIMEText(BODY_TEXT.encode(CHARSET), 'plain', CHARSET)
+    htmlpart = MIMEText(BODY_HTML.encode(CHARSET), 'html', CHARSET)
+      
+      # Add the text and HTML parts to the child container.
+    msg_body.attach(textpart)
+    msg_body.attach(htmlpart)
+      
+      # Define the attachment part and encode it using MIMEApplication.
+    att = MIMEApplication(open(ATTACHMENT, 'rb').read())
+      
+      # Add a header to tell the email client to treat this part as an attachment,
+      # and to give the attachment a name.
+    att.add_header('Content-Disposition','attachment',filename=os.path.basename(ATTACHMENT))
+      
+      # Attach the multipart/alternative child container to the multipart/mixed
+      # parent container.
+    msg.attach(msg_body)
+      
+      # Add the attachment to the parent container.
+    msg.attach(att)
+      #print(msg)
+    try:
+          #Provide the contents of the email.
+        response = client.send_raw_email(
+        Source=SENDER,
+        Destinations=[
+        RECIPIENT
+              ],
+              RawMessage={
+                  'Data':msg.as_string(),
+              }
+              
+          )
+      # Display an error if something goes wrong.	
+    except ClientError as e:
+        print(e.response['Error']['Message'])
+    else:
+        print("Email sent! Message ID:",response['MessageId'])
+      
+def save_to_s3(userList_csvFile,S3BucketName,s3ObjectPath):
+    try:
+        s3 = boto3.resource('s3')
+        print("s3ObjectName",s3ObjectPath)
+        s3.meta.client.upload_file(userList_csvFile, S3BucketName, s3ObjectPath)
+    except Exception as e:
+        return "Exception " +str(e)
+    return "Success"
+
+def getRecordsByColumn(tableName,columnName,columnValue):
+    onlyColumns = "UserName,AccountID,pwd_last_used"
+    table = dynamodbResource.Table(tableName)
+    response = table.scan(
+        Select='SPECIFIC_ATTRIBUTES',
+        ProjectionExpression=onlyColumns,
+        FilterExpression=Attr(columnName).eq(columnValue) &
+        Attr('Password_Enabled').eq('True') & 
+        Attr('pwd_last_used').ne('NULL')
+        )
+    #print("response",response)
+    #return response['Items']    
+    
+    return response
+    
